@@ -17,7 +17,7 @@
 
 package org.apache.spark.sql.execution.streaming.state
 
-import java.io.{File, FileInputStream, InputStream}
+import java.io.{File, FileInputStream, InputStream, IOException}
 import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.Files
 import java.util.UUID
@@ -143,6 +143,13 @@ class RocksDBFileManager(
   private lazy val sparkConf = Option(SparkEnv.get).map(_.conf).getOrElse(new SparkConf)
 
   private def codec = CompressionCodec.createCodec(sparkConf, codecName)
+
+
+  // Retry configuration for checkpoint file zipping (hardcoded values)
+  private def zipRetryEnabled: Boolean = true
+  private def zipRetryMaxAttempts: Int = 3
+  private def zipRetryBackoffMs: Long = 1000L
+
 
   @volatile private var fileMappings = RocksDBFileMappings(
     new ConcurrentHashMap[Long, Seq[RocksDBImmutableFile]],
@@ -635,9 +642,67 @@ class RocksDBFileManager(
   /**
    * Compress files to a single zip file in DFS. Only the file names are embedded in the zip.
    * Any error while writing will ensure that the file is not written.
+   * Retries the operation with exponential backoff to handle transient connection failures.
+   * Retry behavior uses hardcoded values:
+   * - Retries enabled: true
+   * - Max attempts: 3
+   * - Backoff delay: 1000ms
    */
   private def zipToDfsFile(files: Seq[File], dfsZipFile: Path): Unit = {
     lazy val filesStr = s"$dfsZipFile\n\t${files.mkString("\n\t")}"
+    logInfo(s"zipToDfsFile zipRetryEnabled: ${zipRetryEnabled}")
+
+    if (!zipRetryEnabled) {
+      // If retry is disabled, execute without retry logic (original behavior)
+      zipToDfsFileSingleAttempt(files, dfsZipFile, filesStr)
+      return
+    }
+
+    val maxRetries = zipRetryMaxAttempts
+    val backoffMs = zipRetryBackoffMs
+    var lastException: Exception = null
+    var attempt = 0
+    while (attempt <= maxRetries) {
+      try {
+        // Recreate the connection on each retry attempt by calling single attempt method
+        zipToDfsFileSingleAttempt(files, dfsZipFile, filesStr)
+        return  // Success, exit retry loop
+      } catch {
+        case e: IOException =>
+          lastException = e
+          val exceptionDetails = s"${e.getClass.getName}: ${Option(e.getMessage).getOrElse("null")}"
+          if (attempt < maxRetries) {
+            logWarning(s"Error zipping to $filesStr on attempt ${attempt + 1}/${maxRetries + 1}. " +
+              s"Exception: $exceptionDetails. Retrying in ${backoffMs}ms...", e)
+            Thread.sleep(backoffMs)
+            attempt += 1
+          } else {
+            logError(s"Error zipping to $filesStr after ${maxRetries + 1} attempts. " +
+              s"Exception: $exceptionDetails", e)
+            throw e
+          }
+        case e: Exception =>
+          // For non-IO exceptions, don't retry
+          val exceptionDetails = s"${e.getClass.getName}: ${Option(e.getMessage).getOrElse("null")}"
+          logError(s"Error zipping to $filesStr. Exception: $exceptionDetails", e)
+          throw e
+      }
+    }
+
+    // Should not reach here, but just in case
+    if (lastException != null) {
+      throw lastException
+    }
+  }
+
+  /**
+   * Single attempt to compress files to a single zip file in DFS.
+   * This is the core zipping logic extracted for reuse with/without retry.
+   */
+  private def zipToDfsFileSingleAttempt(
+                                         files: Seq[File],
+                                         dfsZipFile: Path,
+                                         filesStr: String): Unit = {
     var in: InputStream = null
     val out = fm.createAtomic(dfsZipFile, overwriteIfPossible = true)
     var totalBytes = 0L
@@ -661,6 +726,9 @@ class RocksDBFileManager(
         // Cancel the actual output stream first, so that zout.close() does not write the file
         out.cancel()
         logError(s"Error zipping to $filesStr", e)
+        val exceptionDetails = s"Before Error zipping ${e.getClass.getName}: " +
+          s"${Option(e.getMessage).getOrElse("null")}"
+        logError(s"Error zipping to $filesStr. Exception: $exceptionDetails", e)
         throw e
     } finally {
       // Close everything no matter what happened
@@ -668,6 +736,7 @@ class RocksDBFileManager(
       IOUtils.closeQuietly(zout)
     }
   }
+
 
   /** Log the files present in a directory. This is useful for debugging. */
   private def logFilesInDir(dir: File, msg: String): Unit = {
